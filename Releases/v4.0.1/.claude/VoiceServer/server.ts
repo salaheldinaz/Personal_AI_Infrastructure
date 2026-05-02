@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Voice Server - Personal AI Voice notification server with pluggable TTS providers (ElevenLabs, kokoro-fastapi)
+ * Voice Server - Personal AI Voice notification server with pluggable TTS providers (ElevenLabs, kokoro-fastapi, local)
  *
  * Architecture: Pure pass-through. All voice config comes from settings.json.
  * The server has zero hardcoded voice parameters.
@@ -20,8 +20,9 @@ import { homedir } from "os";
 import { join } from "path";
 import { existsSync, readFileSync } from "fs";
 
-// Load .env from user home directory
-const envPath = join(homedir(), '.env');
+// Load .env — try PAI config dir first (~/.config/PAI/.env), fall back to ~/.env
+const paiEnvPath = join(homedir(), '.config', 'PAI', '.env');
+const envPath = existsSync(paiEnvPath) ? paiEnvPath : join(homedir(), '.env');
 if (existsSync(envPath)) {
   const envContent = await Bun.file(envPath).text();
   envContent.split('\n').forEach(line => {
@@ -36,8 +37,7 @@ const PORT = parseInt(process.env.PORT || "8888");
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 
 if (!ELEVENLABS_API_KEY) {
-  console.error('⚠️  ELEVENLABS_API_KEY not found in ~/.env');
-  console.error('Add: ELEVENLABS_API_KEY=your_key_here');
+  console.warn('⚠️  ELEVENLABS_API_KEY not set — ElevenLabs TTS unavailable, local TTS will be used as fallback');
 }
 
 // ==========================================================================
@@ -143,7 +143,8 @@ interface LoadedVoiceConfig {
   voices: Record<string, VoiceEntry>;     // keyed by name ("main", "algorithm")
   voicesByVoiceId: Record<string, VoiceEntry>;  // keyed by voiceId for lookup
   desktopNotifications: boolean;  // whether to show macOS notification banners
-  ttsProvider: 'elevenlabs' | 'kokoro';  // voiceServer.tts_provider in settings.json
+  ttsProvider: 'elevenlabs' | 'local' | 'kokoro';  // voiceServer.tts_provider in settings.json
+  localVoice: string;  // voiceServer.local_voice in settings.json (macOS say voice name)
   kokoroUrl: string;   // voiceServer.kokoro_url in settings.json
   kokoroVoice: string; // voiceServer.kokoro_voice in settings.json
 }
@@ -165,7 +166,7 @@ function loadVoiceConfig(): LoadedVoiceConfig {
   try {
     if (!existsSync(settingsPath)) {
       console.warn('⚠️  settings.json not found — using fallback voice defaults');
-      return { defaultVoiceId: '', voices: {}, voicesByVoiceId: {}, desktopNotifications: true, ttsProvider: 'elevenlabs', kokoroUrl: 'http://localhost:8880', kokoroVoice: 'af_sky' };
+      return { defaultVoiceId: '', voices: {}, voicesByVoiceId: {}, desktopNotifications: true, ttsProvider: 'elevenlabs', localVoice: 'Samantha', kokoroUrl: 'http://localhost:8880', kokoroVoice: 'af_sky' };
     }
 
     const content = readFileSync(settingsPath, 'utf-8');
@@ -174,7 +175,8 @@ function loadVoiceConfig(): LoadedVoiceConfig {
     const voicesSection = daidentity.voices || {};
     const desktopNotifications = settings.notifications?.desktop?.enabled !== false;
     const voiceServer = settings.voiceServer || {};
-    const ttsProvider: 'elevenlabs' | 'kokoro' = voiceServer.tts_provider === 'kokoro' ? 'kokoro' : 'elevenlabs';
+    const ttsProvider: 'elevenlabs' | 'local' | 'kokoro' = voiceServer.tts_provider === 'kokoro' ? 'kokoro' : voiceServer.tts_provider === 'local' ? 'local' : 'elevenlabs';
+    const localVoice: string = voiceServer.local_voice || 'Samantha';
     const kokoroUrl: string = voiceServer.kokoro_url || 'http://localhost:8880';
     const kokoroVoice: string = voiceServer.kokoro_voice || 'af_sky';
 
@@ -209,10 +211,10 @@ function loadVoiceConfig(): LoadedVoiceConfig {
       console.log(`   ${name}: ${entry.voiceName || entry.voiceId} (speed: ${entry.speed}, stability: ${entry.stability})`);
     }
 
-    return { defaultVoiceId, voices, voicesByVoiceId, desktopNotifications, ttsProvider, kokoroUrl, kokoroVoice };
+    return { defaultVoiceId, voices, voicesByVoiceId, desktopNotifications, ttsProvider, localVoice, kokoroUrl, kokoroVoice };
   } catch (error) {
     console.error('⚠️  Failed to load settings.json voice config:', error);
-    return { defaultVoiceId: '', voices: {}, voicesByVoiceId: {}, desktopNotifications: true, ttsProvider: 'elevenlabs', kokoroUrl: 'http://localhost:8880', kokoroVoice: 'af_sky' };
+    return { defaultVoiceId: '', voices: {}, voicesByVoiceId: {}, desktopNotifications: true, ttsProvider: 'elevenlabs', localVoice: 'Samantha', kokoroUrl: 'http://localhost:8880', kokoroVoice: 'af_sky' };
   }
 }
 
@@ -428,6 +430,93 @@ async function playAudio(audioBuffer: ArrayBuffer, volume: number = FALLBACK_VOL
   });
 }
 
+// ==========================================================================
+// Local TTS Voice Catalogue
+// ==========================================================================
+
+interface LocalVoiceInfo {
+  name: string;
+  locale: string;
+  accent: string;
+  gender: string;
+  category: 'natural' | 'classic' | 'novelty';
+  sample: string;
+}
+
+// Curated catalogue of realistic English voices available via macOS say command.
+// Novelty voices (Albert, Bahh, Bells, etc.) are excluded from this list.
+const LOCAL_VOICE_CATALOGUE: LocalVoiceInfo[] = [
+  // Natural — modern high-quality voices
+  { name: 'Samantha',              locale: 'en_US', accent: 'American',        gender: 'female', category: 'natural',  sample: 'Clear, neutral American female — good all-purpose default' },
+  { name: 'Eddy (English (US))',   locale: 'en_US', accent: 'American',        gender: 'male',   category: 'natural',  sample: 'Modern American male with natural cadence' },
+  { name: 'Flo (English (US))',    locale: 'en_US', accent: 'American',        gender: 'female', category: 'natural',  sample: 'Modern American female, warm and conversational' },
+  { name: 'Reed (English (US))',   locale: 'en_US', accent: 'American',        gender: 'male',   category: 'natural',  sample: 'Modern American male, clear and professional' },
+  { name: 'Rocko (English (US))',  locale: 'en_US', accent: 'American',        gender: 'male',   category: 'natural',  sample: 'Modern American male, energetic tone' },
+  { name: 'Sandy (English (US))',  locale: 'en_US', accent: 'American',        gender: 'female', category: 'natural',  sample: 'Modern American female, upbeat and friendly' },
+  { name: 'Shelley (English (US))',locale: 'en_US', accent: 'American',        gender: 'female', category: 'natural',  sample: 'Modern American female, calm and measured' },
+  { name: 'Daniel',                locale: 'en_GB', accent: 'British',         gender: 'male',   category: 'natural',  sample: 'British male — professional, clear RP accent' },
+  { name: 'Eddy (English (UK))',   locale: 'en_GB', accent: 'British',         gender: 'male',   category: 'natural',  sample: 'Modern British male, natural and conversational' },
+  { name: 'Flo (English (UK))',    locale: 'en_GB', accent: 'British',         gender: 'female', category: 'natural',  sample: 'Modern British female, warm and clear' },
+  { name: 'Reed (English (UK))',   locale: 'en_GB', accent: 'British',         gender: 'male',   category: 'natural',  sample: 'Modern British male, measured and reliable' },
+  { name: 'Rocko (English (UK))',  locale: 'en_GB', accent: 'British',         gender: 'male',   category: 'natural',  sample: 'Modern British male, confident tone' },
+  { name: 'Sandy (English (UK))',  locale: 'en_GB', accent: 'British',         gender: 'female', category: 'natural',  sample: 'Modern British female, friendly and clear' },
+  { name: 'Shelley (English (UK))',locale: 'en_GB', accent: 'British',         gender: 'female', category: 'natural',  sample: 'Modern British female, calm and professional' },
+  { name: 'Karen',                 locale: 'en_AU', accent: 'Australian',      gender: 'female', category: 'natural',  sample: 'Australian female — distinctive, friendly accent' },
+  { name: 'Moira',                 locale: 'en_IE', accent: 'Irish',           gender: 'female', category: 'natural',  sample: 'Irish female — warm, melodic accent' },
+  { name: 'Tessa',                 locale: 'en_ZA', accent: 'South African',   gender: 'female', category: 'natural',  sample: 'South African female — distinctive and clear' },
+  { name: 'Rishi',                 locale: 'en_IN', accent: 'Indian English',  gender: 'male',   category: 'natural',  sample: 'Indian English male — clear and distinctive' },
+  // Classic — older synthesised voices, still intelligible
+  { name: 'Fred',                  locale: 'en_US', accent: 'American',        gender: 'male',   category: 'classic',  sample: 'Classic American male, robotic but reliable' },
+  { name: 'Kathy',                 locale: 'en_US', accent: 'American',        gender: 'female', category: 'classic',  sample: 'Classic American female synthesiser' },
+  { name: 'Junior',                locale: 'en_US', accent: 'American',        gender: 'male',   category: 'classic',  sample: 'Classic high-pitched American male' },
+  { name: 'Ralph',                 locale: 'en_US', accent: 'American',        gender: 'male',   category: 'classic',  sample: 'Classic gruff American male' },
+];
+
+// Get voices installed on this system that are also in our catalogue
+async function getInstalledLocalVoices(): Promise<LocalVoiceInfo[]> {
+  try {
+    const result = await new Promise<string>((resolve, reject) => {
+      const proc = spawn('/usr/bin/say', ['-v', '?']);
+      let output = '';
+      proc.stdout?.on('data', (d: Buffer) => { output += d.toString(); });
+      proc.on('error', reject);
+      proc.on('exit', () => resolve(output));
+    });
+
+    const installedNames = new Set(
+      result.split('\n')
+        .filter(line => /en_/.test(line))
+        .map(line => line.split(/\s{2,}/)[0].trim())
+    );
+
+    return LOCAL_VOICE_CATALOGUE.filter(v => installedNames.has(v.name));
+  } catch {
+    return LOCAL_VOICE_CATALOGUE; // fallback: return full catalogue
+  }
+}
+
+// Play audio using macOS say command (local TTS — no API key required)
+async function playLocalSpeech(text: string, voice: string, volume: number = FALLBACK_VOLUME): Promise<void> {
+  const tempFile = `/tmp/voice-local-${Date.now()}.aiff`;
+
+  await new Promise<void>((resolve, reject) => {
+    const proc = spawn('/usr/bin/say', ['-v', voice, '-o', tempFile, text]);
+    proc.on('error', reject);
+    proc.on('exit', (code) => {
+      code === 0 ? resolve() : reject(new Error(`say exited with code ${code}`));
+    });
+  });
+
+  return new Promise((resolve, reject) => {
+    const proc = spawn('/usr/bin/afplay', ['-v', volume.toString(), tempFile]);
+    proc.on('error', reject);
+    proc.on('exit', (code) => {
+      spawn('/bin/rm', [tempFile]);
+      code === 0 ? resolve() : reject(new Error(`afplay exited with code ${code}`));
+    });
+  });
+}
+
 // Spawn a process safely
 function spawnSafe(command: string, args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -504,11 +593,29 @@ async function sendNotification(
         await playAudio(audioBuffer, resolvedVolume);
         voicePlayed = true;
       } catch (error: any) {
-        console.error("Kokoro TTS failed:", error);
-        voiceError = error.message || "Kokoro TTS failed";
+        console.warn(`⚠️  Kokoro TTS failed: ${error.message} — falling back to local TTS`);
+        try {
+          const resolvedVolume = callerVolume ?? voiceConfig.voices.main?.volume ?? FALLBACK_VOLUME;
+          await playLocalSpeech(safeMessage, voiceConfig.localVoice, resolvedVolume);
+          voicePlayed = true;
+        } catch (localError: any) {
+          console.error("Local TTS fallback also failed:", localError);
+          voiceError = error.message;
+        }
       }
-    } else if (ELEVENLABS_API_KEY) {
-      // ElevenLabs cloud TTS
+    } else if (provider === 'local' || !ELEVENLABS_API_KEY) {
+      // Local TTS: explicit config or no API key available
+      try {
+        const resolvedVolume = callerVolume ?? voiceConfig.voices.main?.volume ?? FALLBACK_VOLUME;
+        console.log(`🔊 Local TTS (${provider === 'local' ? 'configured' : 'no API key'}): voice=${voiceConfig.localVoice}`);
+        await playLocalSpeech(safeMessage, voiceConfig.localVoice, resolvedVolume);
+        voicePlayed = true;
+      } catch (error: any) {
+        console.error("Local TTS failed:", error);
+        voiceError = error.message || "Local TTS failed";
+      }
+    } else {
+      // ElevenLabs with automatic local TTS fallback
       try {
         const voice = voiceId || DEFAULT_VOICE_ID;
 
@@ -557,8 +664,15 @@ async function sendNotification(
         await playAudio(audioBuffer, resolvedVolume);
         voicePlayed = true;
       } catch (error: any) {
-        console.error("Failed to generate/play speech:", error);
-        voiceError = error.message || "TTS generation failed";
+        console.warn(`⚠️  ElevenLabs TTS failed: ${error.message} — falling back to local TTS`);
+        try {
+          const resolvedVolume = callerVolume ?? voiceConfig.voices.main?.volume ?? FALLBACK_VOLUME;
+          await playLocalSpeech(safeMessage, voiceConfig.localVoice, resolvedVolume);
+          voicePlayed = true;
+        } catch (localError: any) {
+          console.error("Local TTS fallback also failed:", localError);
+          voiceError = error.message;
+        }
       }
     }
   }
@@ -734,14 +848,35 @@ const server = serve({
       }
     }
 
+    if (url.pathname === "/voices/local" && req.method === "GET") {
+      const voices = await getInstalledLocalVoices();
+      const current = voiceConfig.localVoice;
+      return new Response(
+        JSON.stringify({
+          current_voice: current,
+          how_to_change: 'Set voiceServer.local_voice in ~/.claude/settings.json',
+          voices: voices.map(v => ({
+            ...v,
+            active: v.name === current,
+          })),
+        }),
+        {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+          status: 200
+        }
+      );
+    }
+
     if (url.pathname === "/health") {
       return new Response(
         JSON.stringify({
           status: "healthy",
           port: PORT,
           tts_provider: voiceConfig.ttsProvider,
-          default_voice_id: DEFAULT_VOICE_ID,
+          local_voice: voiceConfig.localVoice,
+          local_tts_available: existsSync('/usr/bin/say'),
           elevenlabs_api_key_configured: !!ELEVENLABS_API_KEY,
+          default_voice_id: DEFAULT_VOICE_ID,
           pronunciation_rules: pronunciationRules.length,
           configured_voices: Object.keys(voiceConfig.voices),
           kokoro_url: voiceConfig.kokoroUrl,
@@ -754,7 +889,7 @@ const server = serve({
       );
     }
 
-    return new Response("Voice Server - POST to /notify, /notify/personality, or /pai", {
+    return new Response("Voice Server — POST /notify | GET /health | GET /voices/local", {
       headers: corsHeaders,
       status: 200
     });
@@ -762,8 +897,8 @@ const server = serve({
 });
 
 console.log(`🚀 Voice Server running on port ${PORT}`);
-console.log(`🔊 TTS: ${voiceConfig.ttsProvider === 'kokoro' ? `kokoro-fastapi (${voiceConfig.kokoroVoice} @ ${voiceConfig.kokoroUrl})` : ELEVENLABS_API_KEY ? `ElevenLabs (default voice: ${DEFAULT_VOICE_ID})` : `⚠️  no provider — ElevenLabs key missing`}`);
+console.log(`🔊 TTS: ${voiceConfig.ttsProvider === 'kokoro' ? `kokoro-fastapi (${voiceConfig.kokoroVoice} @ ${voiceConfig.kokoroUrl}) + local fallback (${voiceConfig.localVoice})` : voiceConfig.ttsProvider === 'local' ? `local only (${voiceConfig.localVoice})` : ELEVENLABS_API_KEY ? `ElevenLabs + local fallback (${voiceConfig.localVoice})` : `local only — no ElevenLabs API key (${voiceConfig.localVoice})`}`);
+console.log(`🔑 ElevenLabs API Key: ${ELEVENLABS_API_KEY ? '✅ Configured' : '❌ Not set'}`);
 console.log(`📡 POST to http://localhost:${PORT}/notify`);
 console.log(`🔒 Security: CORS restricted to localhost, rate limiting enabled`);
-console.log(`🔑 ElevenLabs API Key: ${ELEVENLABS_API_KEY ? '✅ Configured' : '❌ Not set'}`);
 console.log(`📖 Pronunciations: ${pronunciationRules.length} rules loaded`);

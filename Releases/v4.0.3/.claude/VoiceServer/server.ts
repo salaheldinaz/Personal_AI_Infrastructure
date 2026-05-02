@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Voice Server - Personal AI Voice notification server using ElevenLabs TTS
+ * Voice Server - Personal AI Voice notification server with pluggable TTS providers (ElevenLabs, kokoro-fastapi, local)
  *
  * Architecture: Pure pass-through. All voice config comes from settings.json.
  * The server has zero hardcoded voice parameters.
@@ -102,6 +102,13 @@ function applyPronunciations(text: string): string {
   return result;
 }
 
+// Apply pronunciations and log any changes — shared by all TTS providers
+function preprocessForTTS(text: string): string {
+  const pronouncedText = applyPronunciations(text);
+  if (pronouncedText !== text) console.log(`📖 Pronunciation: "${text}" → "${pronouncedText}"`);
+  return pronouncedText;
+}
+
 // Load pronunciations at startup
 loadPronunciations();
 
@@ -136,8 +143,10 @@ interface LoadedVoiceConfig {
   voices: Record<string, VoiceEntry>;     // keyed by name ("main", "algorithm")
   voicesByVoiceId: Record<string, VoiceEntry>;  // keyed by voiceId for lookup
   desktopNotifications: boolean;  // whether to show macOS notification banners
-  ttsProvider: 'elevenlabs' | 'local';  // voiceServer.tts_provider in settings.json
+  ttsProvider: 'elevenlabs' | 'local' | 'kokoro';  // voiceServer.tts_provider in settings.json
   localVoice: string;  // voiceServer.local_voice in settings.json (macOS say voice name)
+  kokoroUrl: string;   // voiceServer.kokoro_url in settings.json
+  kokoroVoice: string; // voiceServer.kokoro_voice in settings.json
 }
 
 // Last-resort defaults if settings.json is entirely missing or unparseable
@@ -157,7 +166,7 @@ function loadVoiceConfig(): LoadedVoiceConfig {
   try {
     if (!existsSync(settingsPath)) {
       console.warn('⚠️  settings.json not found — using fallback voice defaults');
-      return { defaultVoiceId: '', voices: {}, voicesByVoiceId: {}, desktopNotifications: true, ttsProvider: 'elevenlabs', localVoice: 'Samantha' };
+      return { defaultVoiceId: '', voices: {}, voicesByVoiceId: {}, desktopNotifications: true, ttsProvider: 'elevenlabs', localVoice: 'Samantha', kokoroUrl: 'http://localhost:8880', kokoroVoice: 'af_sky' };
     }
 
     const content = readFileSync(settingsPath, 'utf-8');
@@ -166,8 +175,10 @@ function loadVoiceConfig(): LoadedVoiceConfig {
     const voicesSection = daidentity.voices || {};
     const desktopNotifications = settings.notifications?.desktop?.enabled !== false;
     const voiceServer = settings.voiceServer || {};
-    const ttsProvider: 'elevenlabs' | 'local' = voiceServer.tts_provider === 'local' ? 'local' : 'elevenlabs';
+    const ttsProvider: 'elevenlabs' | 'local' | 'kokoro' = voiceServer.tts_provider === 'kokoro' ? 'kokoro' : voiceServer.tts_provider === 'local' ? 'local' : 'elevenlabs';
     const localVoice: string = voiceServer.local_voice || 'Samantha';
+    const kokoroUrl: string = voiceServer.kokoro_url || 'http://localhost:8880';
+    const kokoroVoice: string = voiceServer.kokoro_voice || 'af_sky';
 
     // Build lookup maps
     const voices: Record<string, VoiceEntry> = {};
@@ -200,10 +211,10 @@ function loadVoiceConfig(): LoadedVoiceConfig {
       console.log(`   ${name}: ${entry.voiceName || entry.voiceId} (speed: ${entry.speed}, stability: ${entry.stability})`);
     }
 
-    return { defaultVoiceId, voices, voicesByVoiceId, desktopNotifications, ttsProvider, localVoice };
+    return { defaultVoiceId, voices, voicesByVoiceId, desktopNotifications, ttsProvider, localVoice, kokoroUrl, kokoroVoice };
   } catch (error) {
     console.error('⚠️  Failed to load settings.json voice config:', error);
-    return { defaultVoiceId: '', voices: {}, voicesByVoiceId: {}, desktopNotifications: true, ttsProvider: 'elevenlabs', localVoice: 'Samantha' };
+    return { defaultVoiceId: '', voices: {}, voicesByVoiceId: {}, desktopNotifications: true, ttsProvider: 'elevenlabs', localVoice: 'Samantha', kokoroUrl: 'http://localhost:8880', kokoroVoice: 'af_sky' };
   }
 }
 
@@ -344,12 +355,7 @@ async function generateSpeech(
     throw new Error('ElevenLabs API key not configured');
   }
 
-  // Apply pronunciation replacements before sending to TTS
-  const pronouncedText = applyPronunciations(text);
-  if (pronouncedText !== text) {
-    console.log(`📖 Pronunciation: "${text}" → "${pronouncedText}"`);
-  }
-
+  const pronouncedText = preprocessForTTS(text);
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
 
   const response = await fetch(url, {
@@ -374,6 +380,30 @@ async function generateSpeech(
   return await response.arrayBuffer();
 }
 
+// Generate speech using kokoro-fastapi (OpenAI-compatible local TTS)
+async function generateKokoroSpeech(text: string): Promise<ArrayBuffer> {
+  const pronouncedText = preprocessForTTS(text);
+  const url = `${voiceConfig.kokoroUrl}/v1/audio/speech`;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'kokoro',
+      input: pronouncedText,
+      voice: voiceConfig.kokoroVoice,
+      response_format: 'mp3',
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Kokoro API error: ${response.status} - ${errorText}`);
+  }
+
+  return await response.arrayBuffer();
+}
+
 // Play audio using afplay (macOS)
 async function playAudio(audioBuffer: ArrayBuffer, volume: number = FALLBACK_VOLUME): Promise<void> {
   const tempFile = `/tmp/voice-${Date.now()}.mp3`;
@@ -384,6 +414,7 @@ async function playAudio(audioBuffer: ArrayBuffer, volume: number = FALLBACK_VOL
     const proc = spawn('/usr/bin/afplay', ['-v', volume.toString(), tempFile]);
 
     proc.on('error', (error) => {
+      spawn('/bin/rm', [tempFile]);
       console.error('Error playing audio:', error);
       reject(error);
     });
@@ -553,7 +584,26 @@ async function sendNotification(
   if (voiceEnabled) {
     const provider = voiceConfig.ttsProvider;
 
-    if (provider === 'local' || !ELEVENLABS_API_KEY) {
+    if (provider === 'kokoro') {
+      // Kokoro-fastapi: self-hosted OpenAI-compatible neural TTS
+      try {
+        const resolvedVolume = callerVolume ?? voiceConfig.voices.main?.volume ?? FALLBACK_VOLUME;
+        console.log(`🍃 Kokoro TTS: voice=${voiceConfig.kokoroVoice}, url=${voiceConfig.kokoroUrl}`);
+        const audioBuffer = await generateKokoroSpeech(safeMessage);
+        await playAudio(audioBuffer, resolvedVolume);
+        voicePlayed = true;
+      } catch (error: any) {
+        console.warn(`⚠️  Kokoro TTS failed: ${error.message} — falling back to local TTS`);
+        try {
+          const resolvedVolume = callerVolume ?? voiceConfig.voices.main?.volume ?? FALLBACK_VOLUME;
+          await playLocalSpeech(safeMessage, voiceConfig.localVoice, resolvedVolume);
+          voicePlayed = true;
+        } catch (localError: any) {
+          console.error("Local TTS fallback also failed:", localError);
+          voiceError = error.message;
+        }
+      }
+    } else if (provider === 'local' || !ELEVENLABS_API_KEY) {
       // Local TTS: explicit config or no API key available
       try {
         const resolvedVolume = callerVolume ?? voiceConfig.voices.main?.volume ?? FALLBACK_VOLUME;
@@ -829,6 +879,8 @@ const server = serve({
           default_voice_id: DEFAULT_VOICE_ID,
           pronunciation_rules: pronunciationRules.length,
           configured_voices: Object.keys(voiceConfig.voices),
+          kokoro_url: voiceConfig.kokoroUrl,
+          kokoro_voice: voiceConfig.kokoroVoice,
         }),
         {
           headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -845,7 +897,7 @@ const server = serve({
 });
 
 console.log(`🚀 Voice Server running on port ${PORT}`);
-console.log(`🔊 TTS: ${voiceConfig.ttsProvider === 'local' ? `local only (${voiceConfig.localVoice})` : ELEVENLABS_API_KEY ? `ElevenLabs + local fallback (${voiceConfig.localVoice})` : `local only — no ElevenLabs API key (${voiceConfig.localVoice})`}`);
+console.log(`🔊 TTS: ${voiceConfig.ttsProvider === 'kokoro' ? `kokoro-fastapi (${voiceConfig.kokoroVoice} @ ${voiceConfig.kokoroUrl}) + local fallback (${voiceConfig.localVoice})` : voiceConfig.ttsProvider === 'local' ? `local only (${voiceConfig.localVoice})` : ELEVENLABS_API_KEY ? `ElevenLabs + local fallback (${voiceConfig.localVoice})` : `local only — no ElevenLabs API key (${voiceConfig.localVoice})`}`);
 console.log(`🔑 ElevenLabs API Key: ${ELEVENLABS_API_KEY ? '✅ Configured' : '❌ Not set'}`);
 console.log(`📡 POST to http://localhost:${PORT}/notify`);
 console.log(`🔒 Security: CORS restricted to localhost, rate limiting enabled`);
